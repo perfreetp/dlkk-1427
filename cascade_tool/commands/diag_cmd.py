@@ -403,11 +403,333 @@ def healthcheck(project_name, node_id, alarm_limit, auth_limit):
     _print_healthcheck_auth_failures(device_id, auth_data, auth_limit)
     console.print()
 
-    _print_healthcheck_alarms(node_id, alarm_data, alarm_limit)
+    _print_healthcheck_alarms(target_node, ch_data, alarm_data, alarm_limit)
     console.print()
 
-    _print_healthcheck_summary(path, ch_data, auth_data, alarm_data, device_id, node_id)
+    _print_healthcheck_summary(path, ch_data, auth_data, alarm_data, device_id, target_node)
     console.print()
+
+
+@diag_cmd.command("batch-healthcheck")
+@click.argument("project_name")
+@click.option("--ids", "node_ids", default="", help="逗号分隔的节点ID列表")
+@click.option("--file", "id_file", default="", help="从文件读取节点ID（每行一个）")
+@click.option("--output", "-o", "output_file", default="", help="输出详细报告文件路径")
+@click.option("--format", "-f", "fmt", type=click.Choice(["txt", "json", "markdown"]), default="txt", help="报告格式")
+def batch_healthcheck(project_name, node_ids, id_file, output_file, fmt):
+    """批量链路体检 - 一次检查多个设备/通道，汇总排名
+
+    支持逗号分隔ID或从文件读取ID，终端先输出排名汇总，
+    可选输出详细报告文件
+    """
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    ids = []
+    if node_ids:
+        ids = [i.strip() for i in node_ids.split(",") if i.strip()]
+    if id_file:
+        import os
+        if not os.path.exists(id_file):
+            console.print(f"[red]错误: 文件 '{id_file}' 不存在[/red]")
+            return
+        with open(id_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    ids.append(line)
+
+    if not ids:
+        console.print("[yellow]请通过 --ids 或 --file 指定要检查的节点ID[/yellow]")
+        return
+
+    topo_data = config_mgr.load_data_file(project_name, "topology.json")
+    ch_data = config_mgr.load_data_file(project_name, "channels.json")
+    auth_data = config_mgr.load_data_file(project_name, "auth_failures.json")
+    alarm_data = config_mgr.load_data_file(project_name, "alarms.json")
+
+    if not topo_data:
+        console.print(f"[yellow]项目 '{project_name}' 尚无拓扑数据[/yellow]")
+        return
+
+    topology = CascadeNode.from_dict(topo_data)
+
+    results = []
+    not_found = []
+    for nid in ids:
+        path = _find_node_path(topology, nid)
+        if not path:
+            not_found.append(nid)
+            continue
+        target = path[-1]
+        score, issues = _calc_health_score(path, target, ch_data, auth_data, alarm_data)
+        results.append({
+            "node_id": nid,
+            "name": target.name,
+            "node_type": target.node_type.value,
+            "status": target.status.value,
+            "score": score,
+            "issue_count": len(issues),
+            "issues": issues,
+            "path": [n.node_id for n in path]
+        })
+
+    results.sort(key=lambda x: (-x["score"], x["node_id"]))
+
+    console.print()
+    console.print(f"[bold cyan]═══════════════════════════════════════════════[/bold cyan]")
+    console.print(f"[bold cyan]  批量体检汇总 - {project_name}[/bold cyan]")
+    console.print(f"[bold cyan]═══════════════════════════════════════════════[/bold cyan]")
+    console.print()
+    console.print(f"  检查节点: {len(ids)} 个, 成功: {len(results)} 个, 未找到: {len(not_found)} 个")
+    console.print()
+
+    if not_found:
+        console.print(f"  [yellow]未找到节点: {', '.join(not_found)}[/yellow]")
+        console.print()
+
+    if results:
+        table = Table(show_header=True, header_style="bold yellow")
+        table.add_column("排名", width=6)
+        table.add_column("节点ID")
+        table.add_column("名称")
+        table.add_column("类型")
+        table.add_column("状态")
+        table.add_column("问题数", justify="right")
+        table.add_column("风险分", justify="right")
+        table.add_column("主要问题")
+
+        level_styles = {
+            "online": "[green]",
+            "offline": "[red]",
+            "partial": "[yellow]",
+            "unknown": "[dim]"
+        }
+
+        for i, r in enumerate(results, 1):
+            status_str = level_styles.get(r["status"], "") + r["status"] + "[/]"
+            top_issue = r["issues"][0]["category"] if r["issues"] else "-"
+            score_color = "[red]" if r["score"] >= 3 else ("[yellow]" if r["score"] >= 1 else "[green]")
+            score_str = score_color + str(r["score"]) + "[/]"
+            table.add_row(
+                str(i),
+                r["node_id"],
+                r["name"],
+                r["node_type"],
+                status_str,
+                str(r["issue_count"]),
+                score_str,
+                top_issue
+            )
+
+        console.print(table)
+
+    if output_file:
+        from cascade_tool.commands.report_cmd import _build_healthcheck_report
+        import json
+        from datetime import datetime
+        from pathlib import Path
+
+        report_data = {
+            "title": f"{project_name} 批量体检报告",
+            "project": project_name,
+            "generated_at": datetime.now().isoformat(),
+            "total_checked": len(ids),
+            "found": len(results),
+            "not_found": not_found,
+            "summary_rank": [
+                {
+                    "rank": i + 1,
+                    "node_id": r["node_id"],
+                    "name": r["name"],
+                    "node_type": r["node_type"],
+                    "status": r["status"],
+                    "issue_count": r["issue_count"],
+                    "score": r["score"]
+                }
+                for i, r in enumerate(results)
+            ],
+            "details": []
+        }
+
+        for r in results:
+            detail = _build_healthcheck_report(topology, r["node_id"], ch_data, auth_data, alarm_data)
+            report_data["details"].append(detail)
+
+        output_path = Path(output_file)
+        if not output_path.is_absolute():
+            output_path = config_mgr.get_project_dir(project_name) / output_file
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if fmt == "json":
+            content = json.dumps(report_data, indent=2, ensure_ascii=False, default=str)
+        elif fmt == "markdown":
+            content = _batch_report_to_markdown(report_data)
+        else:
+            content = _batch_report_to_txt(report_data)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        console.print()
+        console.print(f"[green]✓ 详细报告已生成: {output_path}[/green]")
+
+    console.print()
+
+
+def _calc_health_score(path: List[CascadeNode], target: CascadeNode,
+                       ch_data: list, auth_data: list, alarm_data: list) -> tuple:
+    """计算体检健康评分和问题列表
+    返回 (score, issues)，分数越高问题越严重
+    """
+    from cascade_tool.models.channel import Channel
+    from cascade_tool.models.alarm import Alarm
+
+    score = 0
+    issues = []
+
+    link_offline = [n for n in path if n.status != OnlineStatus.ONLINE]
+    if link_offline:
+        score += len(link_offline) * 2
+        issues.append({"category": "链路异常", "detail": f"{len(link_offline)} 个节点离线", "severity": "high"})
+
+    device_id = ""
+    for node in reversed(path):
+        if node.node_type == NodeType.DEVICE:
+            device_id = node.node_id
+            break
+
+    if ch_data and (target.node_type == NodeType.CHANNEL or target.node_type == NodeType.DEVICE):
+        channels = [Channel.from_dict(d) for d in ch_data]
+        if target.node_type == NodeType.DEVICE:
+            dev_channels = [c for c in channels if c.parent_device_id == target.node_id]
+            mismatched = [c for c in dev_channels if c.upper_channel_id != c.lower_channel_id]
+            offline_ch = [c for c in dev_channels if c.status != ChannelStatus.ONLINE]
+            if mismatched:
+                score += len(mismatched) * 1
+                issues.append({"category": "通道编号", "detail": f"{len(mismatched)} 个不匹配", "severity": "medium"})
+            if offline_ch:
+                score += len(offline_ch) * 1
+        elif target.node_type == NodeType.CHANNEL:
+            matched = [c for c in channels if c.channel_id == target.node_id]
+            if matched and matched[0].upper_channel_id != matched[0].lower_channel_id:
+                score += 2
+                issues.append({"category": "通道编号", "detail": "上下级不一致", "severity": "high"})
+            if matched and matched[0].status != ChannelStatus.ONLINE:
+                score += 1
+
+    if auth_data and device_id:
+        failures = [AuthFailure.from_dict(d) for d in auth_data]
+        dev_failures = [f for f in failures if f.device_id == device_id]
+        if dev_failures:
+            score += min(len(dev_failures), 5)
+            issues.append({"category": "鉴权失败", "detail": f"{len(dev_failures)} 次", "severity": "high"})
+
+    if alarm_data:
+        alarms = [Alarm.from_dict(d) for d in alarm_data]
+        related_source_ids = {target.node_id}
+        if target.node_type == NodeType.DEVICE and ch_data:
+            channels = [Channel.from_dict(d) for d in ch_data]
+            dev_channels = [c for c in channels if c.parent_device_id == target.node_id]
+            for ch in dev_channels:
+                related_source_ids.add(ch.channel_id)
+        related_unacked = [a for a in alarms if not a.acked and a.source_id in related_source_ids]
+        if related_unacked:
+            score += min(len(related_unacked), 3)
+            issues.append({"category": "未确认告警", "detail": f"{len(related_unacked)} 条", "severity": "medium"})
+
+    return score, issues
+
+
+def _batch_report_to_txt(report: dict) -> str:
+    """批量体检报告 - TXT 格式"""
+    lines = []
+    lines.append("=" * 70)
+    lines.append(report["title"])
+    lines.append("=" * 70)
+    lines.append(f"项目: {report['project']}")
+    lines.append(f"生成时间: {report['generated_at']}")
+    lines.append(f"检查节点: {report['total_checked']} 个")
+    lines.append(f"找到: {report['found']} 个, 未找到: {len(report['not_found'])} 个")
+    if report["not_found"]:
+        lines.append(f"未找到节点: {', '.join(report['not_found'])}")
+    lines.append("")
+
+    lines.append("【排名汇总】")
+    lines.append("-" * 50)
+    for r in report["summary_rank"]:
+        sev = "高" if r["score"] >= 3 else ("中" if r["score"] >= 1 else "低")
+        lines.append(f"  {r['rank']}. [{sev}] {r['name']} ({r['node_id']}) - {r['issue_count']} 个问题, 风险分 {r['score']}")
+    lines.append("")
+
+    lines.append("【详细结果】")
+    lines.append("-" * 50)
+    for i, d in enumerate(report["details"], 1):
+        if not d.get("found"):
+            continue
+        lines.append(f"  #{i} {d['node_name']} ({d['node_id']})")
+        lines.append(f"     类型: {d['node_type']}, 层级: {d['cascade_levels']} 级")
+        if d.get("issues"):
+            for issue in d["issues"]:
+                sev = "严重" if issue["severity"] == "high" else "一般"
+                lines.append(f"     - [{sev}] {issue['category']}: {issue['detail']}")
+        else:
+            lines.append("     - 无异常")
+        lines.append("")
+
+    lines.append("=" * 70)
+    lines.append("报告结束")
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
+def _batch_report_to_markdown(report: dict) -> str:
+    """批量体检报告 - Markdown 格式"""
+    lines = []
+    lines.append(f"# {report['title']}")
+    lines.append("")
+    lines.append(f"- **项目**: {report['project']}")
+    lines.append(f"- **生成时间**: {report['generated_at']}")
+    lines.append(f"- **检查节点**: {report['total_checked']} 个")
+    lines.append(f"- **找到**: {report['found']} 个, **未找到**: {len(report['not_found'])} 个")
+    if report["not_found"]:
+        lines.append(f"- **未找到节点**: {', '.join(report['not_found'])}")
+    lines.append("")
+
+    lines.append("## 排名汇总")
+    lines.append("")
+    lines.append("| 排名 | 节点名称 | 节点ID | 类型 | 状态 | 问题数 | 风险分 |")
+    lines.append("|------|----------|--------|------|------|--------|--------|")
+    for r in report["summary_rank"]:
+        status_icon = "🟢" if r["status"] == "online" else ("🔴" if r["status"] == "offline" else "⚪")
+        score_color = "🔴" if r["score"] >= 3 else ("🟡" if r["score"] >= 1 else "🟢")
+        lines.append(f"| {r['rank']} | {r['name']} | {r['node_id']} | {r['node_type']} | {status_icon} {r['status']} | {r['issue_count']} | {score_color} {r['score']} |")
+    lines.append("")
+
+    lines.append("## 详细结果")
+    lines.append("")
+    for i, d in enumerate(report["details"], 1):
+        if not d.get("found"):
+            continue
+        lines.append(f"### {i}. {d['node_name']} ({d['node_id']})")
+        lines.append("")
+        lines.append(f"- **类型**: {d['node_type']}")
+        lines.append(f"- **级联层级**: {d['cascade_levels']} 级")
+        lines.append("")
+        if d.get("issues"):
+            lines.append("**发现问题**:")
+            lines.append("")
+            for issue in d["issues"]:
+                sev = "🔴 严重" if issue["severity"] == "high" else "🟡 一般"
+                lines.append(f"- {sev} **{issue['category']}**: {issue['detail']}")
+            lines.append("")
+        else:
+            lines.append("✅ 无异常")
+            lines.append("")
+
+    lines.append("---")
+    lines.append("*报告由级联联调工具自动生成*")
+    return "\n".join(lines)
 
 
 def _get_device_id_from_path(path: List[CascadeNode]) -> str:
@@ -552,7 +874,7 @@ def _print_healthcheck_auth_failures(device_id: str, auth_data: list, limit: int
         console.print(f"  [dim]还有 {len(device_failures) - limit} 条记录未显示[/dim]")
 
 
-def _print_healthcheck_alarms(node_id: str, alarm_data: list, limit: int):
+def _print_healthcheck_alarms(target_node: CascadeNode, ch_data: list, alarm_data: list, limit: int):
     """打印未确认告警"""
     console.print("[bold yellow]【4/5】未确认告警[/bold yellow]")
 
@@ -561,17 +883,29 @@ def _print_healthcheck_alarms(node_id: str, alarm_data: list, limit: int):
         return
 
     from cascade_tool.models.alarm import Alarm
+    from cascade_tool.models.channel import Channel
+
     alarms = [Alarm.from_dict(d) for d in alarm_data]
 
-    related_alarms = [a for a in alarms if not a.acked and (
-        a.source_id == node_id or
-        node_id.startswith(a.source_id) or
-        a.source_id.startswith(node_id)
-    )]
+    related_source_ids = {target_node.node_id}
+    if target_node.node_type == NodeType.DEVICE and ch_data:
+        channels = [Channel.from_dict(d) for d in ch_data]
+        dev_channels = [c for c in channels if c.parent_device_id == target_node.node_id]
+        for ch in dev_channels:
+            related_source_ids.add(ch.channel_id)
+
+    related_alarms = [a for a in alarms if not a.acked and a.source_id in related_source_ids]
+    related_alarms.sort(key=lambda x: x.timestamp, reverse=True)
 
     if not related_alarms:
         console.print("  [green]✓ 该节点相关告警全部已确认[/green]")
         return
+
+    source_count = len(related_source_ids) - 1 if target_node.node_type == NodeType.DEVICE else 0
+    if source_count > 0:
+        console.print(f"  [dim]关联设备本身 + {source_count} 个通道，共 {len(related_alarms)} 条未确认[/dim]")
+    else:
+        console.print(f"  [dim]共 {len(related_alarms)} 条未确认[/dim]")
 
     recent = related_alarms[:limit]
     table = Table(show_header=True, header_style="bold yellow")
@@ -605,7 +939,7 @@ def _print_healthcheck_alarms(node_id: str, alarm_data: list, limit: int):
 
 def _print_healthcheck_summary(path: List[CascadeNode], ch_data: list,
                                auth_data: list, alarm_data: list,
-                               device_id: str, node_id: str):
+                               device_id: str, target_node: CascadeNode):
     """打印体检总结"""
     console.print("[bold yellow]【5/5】体检总结[/bold yellow]")
 
@@ -638,10 +972,19 @@ def _print_healthcheck_summary(path: List[CascadeNode], ch_data: list,
 
     if alarm_data:
         from cascade_tool.models.alarm import Alarm
+        from cascade_tool.models.channel import Channel
+
         alarms = [Alarm.from_dict(d) for d in alarm_data]
-        unacked = [a for a in alarms if not a.acked]
-        if unacked:
-            issues.append(("未确认告警", f"{len(unacked)} 条未处理", "medium"))
+        related_source_ids = {target_node.node_id}
+        if target_node.node_type == NodeType.DEVICE and ch_data:
+            channels = [Channel.from_dict(d) for d in ch_data]
+            dev_channels = [c for c in channels if c.parent_device_id == target_node.node_id]
+            for ch in dev_channels:
+                related_source_ids.add(ch.channel_id)
+
+        related_unacked = [a for a in alarms if not a.acked and a.source_id in related_source_ids]
+        if related_unacked:
+            issues.append(("未确认告警", f"{len(related_unacked)} 条未处理", "medium"))
 
     if not issues:
         console.print("  [green]✓ 全部检查项正常[/green]")
@@ -658,6 +1001,6 @@ def _print_healthcheck_summary(path: List[CascadeNode], ch_data: list,
 
         console.print(table)
 
-    console.print(f"\n  [dim]体检节点: {target.name} ({node_id})[/dim]")
+    console.print(f"\n  [dim]体检节点: {target.name} ({target_node.node_id})[/dim]")
     console.print(f"  [dim]级联层级: {len(path)} 级[/dim]")
     console.print(f"  [dim]发现问题: {len(issues)} 项[/dim]")

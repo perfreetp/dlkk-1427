@@ -309,7 +309,10 @@ def check_channel(project_name, mismatch_only, offline_only, profile_name):
 @check_cmd.command("all")
 @click.argument("project_name")
 @click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
-def check_all(project_name, profile_name):
+@click.option("--save-snapshot", is_flag=True, help="检查完成后保存快照")
+@click.option("--snapshot-name", default="", help="快照名称（默认用时间戳）")
+@click.option("--snapshot-desc", default="", help="快照描述")
+def check_all(project_name, profile_name, save_snapshot, snapshot_name, snapshot_desc):
     """执行全部检查项"""
     console.print(f"[bold cyan]=== 开始对项目 '{project_name}' 执行全部检查 ===[/bold cyan]\n")
 
@@ -323,3 +326,120 @@ def check_all(project_name, profile_name):
     check_channel.callback(project_name=project_name, mismatch_only=False, offline_only=False, profile_name=profile_name)
 
     console.print(f"\n[bold green]=== 全部检查完成 ===[/bold green]")
+
+    if save_snapshot:
+        from cascade_tool.commands.report_cmd import _build_report_data
+        try:
+            report_data = _build_report_data(
+                project_name,
+                title="",
+                profile_name=profile_name,
+                profile=None
+            )
+            snap_id = config_mgr.save_snapshot(project_name, report_data, snapshot_name, snapshot_desc)
+            console.print(f"\n[green]✓ 快照已保存: {snap_id}[/green]")
+        except Exception as e:
+            console.print(f"\n[yellow]警告: 保存快照失败 - {e}[/yellow]")
+
+
+@check_cmd.group("snapshot")
+def snapshot_cmd():
+    """管理检查快照"""
+    pass
+
+
+@snapshot_cmd.command("list")
+@click.argument("project_name")
+def list_snapshots(project_name):
+    """列出所有检查快照"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    snapshots = config_mgr.list_snapshots(project_name)
+    if not snapshots:
+        console.print(f"[yellow]项目 '{project_name}' 暂无快照[/yellow]")
+        return
+
+    table = Table(title=f"检查快照列表 - {project_name}", show_header=True, header_style="bold cyan")
+    table.add_column("快照ID")
+    table.add_column("描述")
+    table.add_column("配置")
+    table.add_column("问题数", justify="right")
+    table.add_column("创建时间")
+
+    for s in snapshots:
+        table.add_row(
+            s["id"],
+            s.get("description", "") or "-",
+            s.get("profile_name", "") or "-",
+            str(s.get("issue_count", 0)),
+            s.get("created_at", "")[:19].replace("T", " ")
+        )
+
+    console.print(table)
+
+
+@snapshot_cmd.command("show")
+@click.argument("project_name")
+@click.argument("snapshot_id")
+def show_snapshot(project_name, snapshot_id):
+    """显示快照详情"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    try:
+        snap = config_mgr.get_snapshot(project_name, snapshot_id)
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")
+        return
+
+    console.print()
+    console.print(f"[bold cyan]快照: {snap['id']}[/bold cyan]")
+    console.print(f"  创建时间: {snap.get('created_at', '')}")
+    if snap.get("description"):
+        console.print(f"  描述: {snap['description']}")
+    if snap.get("profile_name"):
+        console.print(f"  使用配置: {snap['profile_name']}")
+
+    summary = snap.get("summary", {})
+    if summary:
+        console.print()
+        console.print("  [bold]摘要:[/bold]")
+        console.print(f"    整体状态: {summary.get('overall_status', '-')}")
+        console.print(f"    节点总数: {summary.get('total_nodes', 0)}")
+        console.print(f"    通道总数: {summary.get('total_channels', 0)}")
+        console.print(f"    通道在线率: {summary.get('channel_online_rate', 0)}%")
+        console.print(f"    严重问题: {summary.get('high_issues', 0)} 个")
+        console.print(f"    一般问题: {summary.get('medium_issues', 0)} 个")
+
+    issues = snap.get("issues", [])
+    if issues:
+        console.print()
+        console.print("  [bold]问题清单:[/bold]")
+        for i, issue in enumerate(issues, 1):
+            sev = "[red]严重[/red]" if issue["severity"] == "high" else "[yellow]一般[/yellow]"
+            console.print(f"    {i}. {sev} {issue['category']} ({issue['count']})")
+            console.print(f"       {issue['description']}")
+    console.print()
+
+
+@snapshot_cmd.command("delete")
+@click.argument("project_name")
+@click.argument("snapshot_id")
+@click.option("--force", "-f", is_flag=True, help="强制删除，不提示")
+def delete_snapshot(project_name, snapshot_id, force):
+    """删除快照"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    if not force:
+        click.confirm(f"确定要删除快照 '{snapshot_id}' 吗？", abort=True)
+
+    try:
+        config_mgr.delete_snapshot(project_name, snapshot_id)
+        console.print(f"[green]✓ 快照 '{snapshot_id}' 已删除[/green]")
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")

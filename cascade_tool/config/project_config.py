@@ -213,3 +213,207 @@ class ProjectConfig:
                 "alarm_type": "all"
             }
         }
+
+    def export_check_profile(self, project_name: str, profile_name: str, output_path: str) -> str:
+        """导出检查配置到文件"""
+        profile = self.get_check_profile(project_name, profile_name)
+        export_data = {
+            "profile_name": profile_name,
+            "source_project": project_name,
+            "exported_at": datetime.now().isoformat(),
+            "version": "1.0",
+            "profile": profile
+        }
+        path = Path(output_path)
+        if not path.suffix:
+            path = path / f"{profile_name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+        return str(path)
+
+    def import_check_profile(self, project_name: str, input_path: str, profile_name: str = "",
+                             overwrite: bool = False) -> str:
+        """从文件导入检查配置"""
+        path = Path(input_path)
+        if not path.exists():
+            raise ValueError(f"配置文件不存在: {input_path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "profile" not in data:
+            raise ValueError("配置文件格式不正确，缺少 profile 字段")
+
+        profile = data["profile"]
+        target_name = profile_name or data.get("profile_name", "")
+        if not target_name:
+            target_name = path.stem
+
+        config = self.get_config(project_name)
+        if "check_profiles" not in config:
+            config["check_profiles"] = {}
+
+        if target_name in config["check_profiles"] and not overwrite:
+            raise ValueError(f"配置 '{target_name}' 已存在，使用 --overwrite 覆盖")
+
+        now = datetime.now().isoformat()
+        profile["imported_at"] = now
+        profile["updated_at"] = now
+        if "created_at" not in profile:
+            profile["created_at"] = now
+
+        config["check_profiles"][target_name] = profile
+        self.update_config(project_name, config)
+        return target_name
+
+    def copy_check_profile(self, src_project: str, src_profile: str,
+                           dst_project: str, dst_profile: str = "",
+                           overwrite: bool = False) -> str:
+        """复制检查配置到另一个项目"""
+        if not self.project_exists(src_project):
+            raise ValueError(f"源项目 '{src_project}' 不存在")
+        if not self.project_exists(dst_project):
+            raise ValueError(f"目标项目 '{dst_project}' 不存在")
+
+        profile = self.get_check_profile(src_project, src_profile)
+        target_name = dst_profile or src_profile
+
+        dst_config = self.get_config(dst_project)
+        if "check_profiles" not in dst_config:
+            dst_config["check_profiles"] = {}
+
+        if target_name in dst_config["check_profiles"] and not overwrite:
+            raise ValueError(f"目标配置 '{target_name}' 已存在，使用 --overwrite 覆盖")
+
+        import copy
+        new_profile = copy.deepcopy(profile)
+        now = datetime.now().isoformat()
+        new_profile["copied_from"] = f"{src_project}/{src_profile}"
+        new_profile["copied_at"] = now
+        new_profile["updated_at"] = now
+        if "created_at" not in new_profile:
+            new_profile["created_at"] = now
+
+        dst_config["check_profiles"][target_name] = new_profile
+        self.update_config(dst_project, dst_config)
+        return target_name
+
+    def _get_snapshots_dir(self, project_name: str) -> Path:
+        """获取快照目录"""
+        if not self.project_exists(project_name):
+            raise ValueError(f"项目 '{project_name}' 不存在")
+        snap_dir = self.get_project_dir(project_name) / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        return snap_dir
+
+    def save_snapshot(self, project_name: str, snapshot_data: dict,
+                      snapshot_name: str = "", description: str = "") -> str:
+        """保存检查快照
+        snapshot_data: 快照数据（通常是 report_data 格式）
+        返回快照ID
+        """
+        snap_dir = self._get_snapshots_dir(project_name)
+        now = datetime.now()
+        snap_id = snapshot_name or now.strftime("%Y%m%d_%H%M%S")
+
+        snapshot = {
+            "id": snap_id,
+            "name": snap_id,
+            "description": description,
+            "created_at": now.isoformat(),
+            "profile_name": snapshot_data.get("used_profile", ""),
+            "data": snapshot_data,
+            "issues": snapshot_data.get("issues", []),
+            "summary": snapshot_data.get("summary", {})
+        }
+
+        snap_file = snap_dir / f"{snap_id}.json"
+        with open(snap_file, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, ensure_ascii=False, default=str)
+
+        return snap_id
+
+    def list_snapshots(self, project_name: str) -> List[Dict[str, Any]]:
+        """列出项目的所有快照"""
+        snap_dir = self._get_snapshots_dir(project_name)
+        snapshots = []
+        for f in sorted(snap_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                with open(f, "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+                snapshots.append({
+                    "id": data.get("id", f.stem),
+                    "name": data.get("name", f.stem),
+                    "description": data.get("description", ""),
+                    "created_at": data.get("created_at", ""),
+                    "profile_name": data.get("profile_name", ""),
+                    "issue_count": len(data.get("issues", [])),
+                    "file_size": f.stat().st_size
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return snapshots
+
+    def get_snapshot(self, project_name: str, snapshot_id: str) -> Dict[str, Any]:
+        """获取指定快照"""
+        snap_dir = self._get_snapshots_dir(project_name)
+        snap_file = snap_dir / f"{snapshot_id}.json"
+        if not snap_file.exists():
+            raise ValueError(f"快照 '{snapshot_id}' 不存在")
+        with open(snap_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def delete_snapshot(self, project_name: str, snapshot_id: str):
+        """删除快照"""
+        snap_dir = self._get_snapshots_dir(project_name)
+        snap_file = snap_dir / f"{snapshot_id}.json"
+        if not snap_file.exists():
+            raise ValueError(f"快照 '{snapshot_id}' 不存在")
+        snap_file.unlink()
+
+    def compare_snapshots(self, project_name: str, snap_id_a: str, snap_id_b: str) -> Dict[str, Any]:
+        """对比两个快照的差异
+        返回: {new, resolved, persistent, summary}
+        A 是旧的，B 是新的
+        """
+        snap_a = self.get_snapshot(project_name, snap_id_a)
+        snap_b = self.get_snapshot(project_name, snap_id_b)
+
+        issues_a = self._normalize_issues(snap_a.get("issues", []))
+        issues_b = self._normalize_issues(snap_b.get("issues", []))
+
+        keys_a = set(issues_a.keys())
+        keys_b = set(issues_b.keys())
+
+        new_keys = keys_b - keys_a
+        resolved_keys = keys_a - keys_b
+        persistent_keys = keys_a & keys_b
+
+        return {
+            "snapshot_a": snap_id_a,
+            "snapshot_b": snap_id_b,
+            "new": [issues_b[k] for k in new_keys],
+            "resolved": [issues_a[k] for k in resolved_keys],
+            "persistent": [
+                {**issues_b[k], "prev_count": issues_a[k].get("count", 0)}
+                for k in persistent_keys
+            ],
+            "summary": {
+                "new_count": len(new_keys),
+                "resolved_count": len(resolved_keys),
+                "persistent_count": len(persistent_keys),
+                "total_before": len(keys_a),
+                "total_after": len(keys_b)
+            }
+        }
+
+    def _normalize_issues(self, issues: list) -> Dict[str, Dict[str, Any]]:
+        """将问题列表规范化为字典，方便对比
+        用 category 作为唯一键
+        """
+        result = {}
+        for issue in issues:
+            key = issue.get("category", str(issue))
+            result[key] = issue
+        return result

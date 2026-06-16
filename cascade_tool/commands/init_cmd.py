@@ -268,3 +268,55 @@ def delete_profile(project_name, profile_name, force):
         console.print(f"[green]✓ 检查配置 '{profile_name}' 已删除[/green]")
     except ValueError as e:
         console.print(f"[red]错误: {e}[/red]")
+
+
+@profile_cmd.command("export")
+@click.argument("project_name")
+@click.argument("profile_name")
+@click.option("--output", "-o", "output_path", default="", help="输出文件或目录路径")
+def export_profile(project_name, profile_name, output_path):
+    """导出检查配置到文件"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    try:
+        if not output_path:
+            output_path = f"{profile_name}.json"
+        result_path = config_mgr.export_check_profile(project_name, profile_name, output_path)
+        console.print(f"[green]✓ 配置已导出: {result_path}[/green]")
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")
+
+
+@profile_cmd.command("import")
+@click.argument("project_name")
+@click.argument("input_path")
+@click.option("--name", "-n", "profile_name", default="", help="导入后的配置名（默认用原配置名）")
+@click.option("--overwrite", "-f", is_flag=True, help="已存在时覆盖")
+def import_profile(project_name, input_path, profile_name, overwrite):
+    """从文件导入检查配置"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    try:
+        name = config_mgr.import_check_profile(project_name, input_path, profile_name, overwrite)
+        console.print(f"[green]✓ 配置已导入: {name}[/green]")
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")
+
+
+@profile_cmd.command("copy")
+@click.argument("src_project")
+@click.argument("src_profile")
+@click.argument("dst_project")
+@click.option("--dst-name", "-d", "dst_profile", default="", help="目标配置名（默认同源名）")
+@click.option("--overwrite", "-f", is_flag=True, help="已存在时覆盖")
+def copy_profile(src_project, src_profile, dst_project, dst_profile, overwrite):
+    """复制检查配置到另一个项目"""
+    try:
+        name = config_mgr.copy_check_profile(src_project, src_profile, dst_project, dst_profile, overwrite)
+        console.print(f"[green]✓ 配置已复制到 {dst_project}/{name}[/green]")
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")

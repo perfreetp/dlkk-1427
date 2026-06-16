@@ -31,7 +31,11 @@ def report_cmd():
 @click.option("--title", default="", help="报告标题")
 @click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
 @click.option("--healthcheck", "healthcheck_node", default="", help="包含指定节点的链路体检结果")
-def generate_report(project_name, fmt, output_file, title, profile_name, healthcheck_node):
+@click.option("--snapshot", "snapshot_id", default="", help="从指定快照生成报告")
+@click.option("--compare-with", "compare_snapshot", default="", help="与指定快照对比生成报告（新 vs 旧）")
+@click.option("--last", "compare_last", is_flag=True, help="与上一次快照对比")
+def generate_report(project_name, fmt, output_file, title, profile_name, healthcheck_node,
+                    snapshot_id, compare_snapshot, compare_last):
     """生成联调报告"""
     if not config_mgr.project_exists(project_name):
         console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
@@ -51,17 +55,58 @@ def generate_report(project_name, fmt, output_file, title, profile_name, healthc
 
     fmt = fmt or "txt"
 
-    report_data = _build_report_data(
-        project_name,
-        title=title,
-        profile_name=profile_name,
-        profile=profile,
-        healthcheck_node=healthcheck_node
-    )
+    compare_data = None
+    if compare_last or compare_snapshot:
+        snapshots = config_mgr.list_snapshots(project_name)
+        if not snapshots:
+            console.print("[yellow]警告: 项目没有快照，无法对比[/yellow]")
+        else:
+            old_id = compare_snapshot
+            if compare_last and len(snapshots) >= 2:
+                old_id = snapshots[1]["id"]
+            elif compare_last and len(snapshots) == 1:
+                old_id = ""
+                console.print("[yellow]警告: 只有一个快照，无法对比[/yellow]")
+
+            if old_id:
+                try:
+                    if snapshot_id:
+                        new_id = snapshot_id
+                    else:
+                        new_id = snapshots[0]["id"]
+                    compare_data = config_mgr.compare_snapshots(project_name, old_id, new_id)
+                    console.print(f"[dim]对比快照: {old_id} → {new_id}[/dim]")
+                except ValueError as e:
+                    console.print(f"[yellow]警告: 对比失败 - {e}[/yellow]")
+
+    if snapshot_id:
+        try:
+            snap = config_mgr.get_snapshot(project_name, snapshot_id)
+            report_data = snap.get("data", snap)
+            report_data["used_profile"] = snap.get("profile_name", "")
+            if not title:
+                title = f"{project_name} 快照报告 - {snapshot_id}"
+                report_data["title"] = title
+            console.print(f"[dim]使用快照: {snapshot_id}[/dim]")
+        except ValueError as e:
+            console.print(f"[red]错误: {e}[/red]")
+            return
+    else:
+        report_data = _build_report_data(
+            project_name,
+            title=title,
+            profile_name=profile_name,
+            profile=profile,
+            healthcheck_node=healthcheck_node
+        )
+
+    if compare_data:
+        report_data["comparison"] = compare_data
 
     if not output_file:
         ext = "md" if fmt == "markdown" else fmt
-        output_file = f"report_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+        suffix = "_comparison" if compare_data else ""
+        output_file = f"report_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{suffix}.{ext}"
 
     output_path = Path(output_file)
     if not output_path.is_absolute():
@@ -181,7 +226,8 @@ def _analyze_online_status(topology: CascadeNode) -> dict:
     result = {
         "platform": {"total": 0, "online": 0, "offline": 0, "partial": 0, "unknown": 0},
         "device": {"total": 0, "online": 0, "offline": 0, "partial": 0, "unknown": 0},
-        "channel": {"total": 0, "online": 0, "offline": 0, "partial": 0, "unknown": 0}
+        "channel": {"total": 0, "online": 0, "offline": 0, "partial": 0, "unknown": 0},
+        "offline_nodes": []
     }
 
     def walk(node: CascadeNode):
@@ -191,12 +237,23 @@ def _analyze_online_status(topology: CascadeNode) -> dict:
             status_key = node.status.value
             if status_key in result[key]:
                 result[key][status_key] += 1
+            if node.status == OnlineStatus.OFFLINE:
+                result["offline_nodes"].append({
+                    "node_id": node.node_id,
+                    "name": node.name,
+                    "node_type": node.node_type.value,
+                    "manufacturer": node.manufacturer or "",
+                    "ip": node.ip or "",
+                    "last_check": node.last_check.isoformat() if node.last_check else ""
+                })
         for child in node.children:
             walk(child)
 
     walk(topology)
 
     for key in result:
+        if key == "offline_nodes":
+            continue
         total = result[key]["total"]
         if total > 0:
             result[key]["online_rate"] = round(result[key]["online"] / total * 100, 2)
@@ -214,6 +271,19 @@ def _analyze_channels(channels: list) -> dict:
     online = sum(1 for c in channels if c.status == ChannelStatus.ONLINE)
     offline = total - online
 
+    mismatched_list = []
+    for c in channels:
+        if c.upper_channel_id != c.lower_channel_id:
+            mismatched_list.append({
+                "channel_id": c.channel_id,
+                "name": c.name,
+                "parent_device_id": c.parent_device_id,
+                "upper_channel_id": c.upper_channel_id,
+                "lower_channel_id": c.lower_channel_id,
+                "status": c.status.value,
+                "manufacturer": c.manufacturer or ""
+            })
+
     return {
         "total": total,
         "matched": matched,
@@ -221,7 +291,8 @@ def _analyze_channels(channels: list) -> dict:
         "match_rate": round(matched / total * 100, 2) if total > 0 else 0,
         "online": online,
         "offline": offline,
-        "online_rate": round(online / total * 100, 2) if total > 0 else 0
+        "online_rate": round(online / total * 100, 2) if total > 0 else 0,
+        "mismatched_channels": mismatched_list
     }
 
 
@@ -230,10 +301,23 @@ def _analyze_auth_failures(failures: list) -> dict:
     reasons = Counter(f.reason for f in failures)
     devices = Counter(f.device_id for f in failures)
 
+    failure_list = []
+    for f in sorted(failures, key=lambda x: x.timestamp, reverse=True):
+        failure_list.append({
+            "fail_id": f.fail_id,
+            "device_id": f.device_id,
+            "device_name": f.device_name,
+            "user": f.user,
+            "reason": f.reason,
+            "timestamp": f.timestamp.isoformat() if f.timestamp else "",
+            "ip": f.ip or ""
+        })
+
     return {
         "total": len(failures),
         "by_reason": dict(reasons.most_common()),
-        "by_device": dict(devices.most_common(10))
+        "by_device": dict(devices.most_common(10)),
+        "failure_list": failure_list
     }
 
 
@@ -243,12 +327,26 @@ def _analyze_alarms(alarms: list) -> dict:
     levels = Counter(a.level.value for a in unacked)
     types = Counter(a.alarm_type.value for a in unacked)
 
+    unacked_list = []
+    for a in sorted(unacked, key=lambda x: x.timestamp, reverse=True):
+        unacked_list.append({
+            "alarm_id": a.alarm_id,
+            "source_id": a.source_id,
+            "source_name": a.source_name,
+            "alarm_type": a.alarm_type.value,
+            "level": a.level.value,
+            "description": a.description,
+            "timestamp": a.timestamp.isoformat() if a.timestamp else "",
+            "acked": a.acked
+        })
+
     return {
         "total": len(alarms),
         "unacked": len(unacked),
         "acked": len(alarms) - len(unacked),
         "by_level": dict(levels.most_common()),
-        "by_type": dict(types.most_common())
+        "by_type": dict(types.most_common()),
+        "unacked_list": unacked_list
     }
 
 
@@ -420,23 +518,30 @@ def _build_healthcheck_report(topology: CascadeNode, node_id: str,
     alarm_info = None
     if alarm_data:
         alarms = [Alarm.from_dict(d) for d in alarm_data]
-        related = [a for a in alarms if not a.acked and (
-            a.source_id == node_id or
-            node_id.startswith(a.source_id) or
-            a.source_id.startswith(node_id)
-        )]
+
+        related_source_ids = {node_id}
+        if target.node_type == NodeType.DEVICE and ch_data:
+            channels = [Channel.from_dict(d) for d in ch_data]
+            dev_channels = [c for c in channels if c.parent_device_id == target.node_id]
+            for ch in dev_channels:
+                related_source_ids.add(ch.channel_id)
+
+        related = [a for a in alarms if not a.acked and a.source_id in related_source_ids]
         if related:
+            related_sorted = sorted(related, key=lambda x: x.timestamp, reverse=True)
             alarm_info = {
-                "total_unacked": len(related),
+                "total_unacked": len(related_sorted),
+                "source_count": len(related_source_ids) - 1 if target.node_type == NodeType.DEVICE else 0,
                 "recent": [
                     {
                         "time": a.timestamp.isoformat() if a.timestamp else "",
                         "level": a.level.value,
                         "type": a.alarm_type.value,
                         "source": a.source_name,
+                        "source_id": a.source_id,
                         "description": a.description
                     }
-                    for a in related[:5]
+                    for a in related_sorted[:10]
                 ]
             }
 
@@ -494,6 +599,44 @@ def _report_to_txt(report: dict) -> str:
         if profile_cfg and profile_cfg.get("description"):
             lines.append(f"配置描述: {profile_cfg['description']}")
     lines.append("")
+
+    cmp_data = report.get("comparison")
+    if cmp_data:
+        lines.append("【快照对比】")
+        lines.append(f"  对比范围: {cmp_data['snapshot_a']} → {cmp_data['snapshot_b']}")
+        cs = cmp_data.get("summary", {})
+        lines.append(f"  问题总数: {cs.get('total_before', 0)} → {cs.get('total_after', 0)}")
+        lines.append(f"  新增问题: {cs.get('new_count', 0)} 个")
+        lines.append(f"  已恢复: {cs.get('resolved_count', 0)} 个")
+        lines.append(f"  持续存在: {cs.get('persistent_count', 0)} 个")
+        lines.append("")
+
+        if cmp_data.get("new"):
+            lines.append("  新增问题:")
+            for issue in cmp_data["new"]:
+                sev = "严重" if issue["severity"] == "high" else "一般"
+                lines.append(f"    + [{sev}] {issue['category']} ({issue.get('count', 0)})")
+                lines.append(f"      {issue['description']}")
+            lines.append("")
+
+        if cmp_data.get("resolved"):
+            lines.append("  已恢复问题:")
+            for issue in cmp_data["resolved"]:
+                sev = "严重" if issue["severity"] == "high" else "一般"
+                lines.append(f"    - [{sev}] {issue['category']} ({issue.get('count', 0)})")
+                lines.append(f"      {issue['description']}")
+            lines.append("")
+
+        if cmp_data.get("persistent"):
+            lines.append("  持续存在问题:")
+            for issue in cmp_data["persistent"]:
+                sev = "严重" if issue["severity"] == "high" else "一般"
+                prev = issue.get("prev_count", 0)
+                curr = issue.get("count", 0)
+                trend = "↑" if curr > prev else ("↓" if curr < prev else "=")
+                lines.append(f"    = [{sev}] {issue['category']} ({prev} → {curr} {trend})")
+                lines.append(f"      {issue['description']}")
+            lines.append("")
 
     s = report["summary"]
     lines.append("【总体评估】")
@@ -600,6 +743,64 @@ def _report_to_txt(report: dict) -> str:
                 lines.append(f"    - [{sev}] {issue['category']}: {issue['detail']}")
         lines.append("")
 
+    lines.append("【异常明细】")
+    lines.append("-" * 50)
+
+    o = report["online_status"]
+    offline_nodes = o.get("offline_nodes", [])
+    if offline_nodes:
+        lines.append(f"  离线节点明细 ({len(offline_nodes)} 个):")
+        for n in offline_nodes:
+            lines.append(f"    - [{n['node_type']}] {n['name']} ({n['node_id']})")
+            if n.get("manufacturer"):
+                lines.append(f"      厂商: {n['manufacturer']}, IP: {n.get('ip', '')}")
+            if n.get("last_check"):
+                lines.append(f"      最后检查: {n['last_check']}")
+        lines.append("")
+
+    c = report["channel_check"]
+    mismatch_list = c.get("mismatched_channels", [])
+    if mismatch_list:
+        lines.append(f"  通道编号不一致明细 ({len(mismatch_list)} 个):")
+        for ch in mismatch_list[:20]:
+            lines.append(f"    - {ch['name']} ({ch['channel_id']})")
+            lines.append(f"      上级: {ch['upper_channel_id']}")
+            lines.append(f"      下级: {ch['lower_channel_id']}")
+            lines.append(f"      状态: {ch['status']}, 厂商: {ch.get('manufacturer', '')}")
+        if len(mismatch_list) > 20:
+            lines.append(f"    ... 还有 {len(mismatch_list) - 20} 条")
+        lines.append("")
+
+    a = report["auth_failures"]
+    fail_list = a.get("failure_list", [])
+    if fail_list:
+        lines.append(f"  鉴权失败明细 ({len(fail_list)} 条):")
+        for f in fail_list[:20]:
+            ts = f.get("timestamp", "")[:16].replace("T", " ") if f.get("timestamp") else ""
+            lines.append(f"    - [{ts}] {f['device_name']} ({f['device_id']})")
+            lines.append(f"      用户: {f['user']}, 原因: {f['reason']}")
+            if f.get("ip"):
+                lines.append(f"      来源IP: {f['ip']}")
+        if len(fail_list) > 20:
+            lines.append(f"    ... 还有 {len(fail_list) - 20} 条")
+        lines.append("")
+
+    alm = report["alarms"]
+    unacked_list = alm.get("unacked_list", [])
+    if unacked_list:
+        lines.append(f"  未确认告警明细 ({len(unacked_list)} 条):")
+        for al in unacked_list[:20]:
+            ts = al.get("timestamp", "")[:16].replace("T", " ") if al.get("timestamp") else ""
+            lines.append(f"    - [{ts}] {al['source_name']} ({al['source_id']})")
+            lines.append(f"      级别: {al['level']}, 类型: {al['alarm_type']}")
+            lines.append(f"      描述: {al['description']}")
+        if len(unacked_list) > 20:
+            lines.append(f"    ... 还有 {len(unacked_list) - 20} 条")
+        lines.append("")
+
+    lines.append("-" * 50)
+    lines.append("")
+
     issues = report["issues"]
     lines.append("【问题清单】")
     if issues:
@@ -631,6 +832,51 @@ def _report_to_markdown(report: dict) -> str:
         if profile_cfg and profile_cfg.get("description"):
             lines.append(f"- **配置描述**: {profile_cfg['description']}")
     lines.append("")
+
+    cmp_data = report.get("comparison")
+    if cmp_data:
+        lines.append("## 快照对比")
+        lines.append("")
+        cs = cmp_data.get("summary", {})
+        lines.append(f"**对比范围**: {cmp_data['snapshot_a']} → {cmp_data['snapshot_b']}")
+        lines.append("")
+        lines.append("| 指标 | 数值 |")
+        lines.append("|------|------|")
+        lines.append(f"| 问题总数 | {cs.get('total_before', 0)} → {cs.get('total_after', 0)} |")
+        lines.append(f"| 🆕 新增问题 | {cs.get('new_count', 0)} 个 |")
+        lines.append(f"| ✅ 已恢复 | {cs.get('resolved_count', 0)} 个 |")
+        lines.append(f"| ⏳ 持续存在 | {cs.get('persistent_count', 0)} 个 |")
+        lines.append("")
+
+        if cmp_data.get("new"):
+            lines.append("### 🆕 新增问题")
+            lines.append("")
+            for issue in cmp_data["new"]:
+                sev = "🔴 严重" if issue["severity"] == "high" else "🟡 一般"
+                lines.append(f"- {sev} **{issue['category']}** ({issue.get('count', 0)})")
+                lines.append(f"  {issue['description']}")
+            lines.append("")
+
+        if cmp_data.get("resolved"):
+            lines.append("### ✅ 已恢复问题")
+            lines.append("")
+            for issue in cmp_data["resolved"]:
+                sev = "🔴 严重" if issue["severity"] == "high" else "🟡 一般"
+                lines.append(f"- {sev} **{issue['category']}** ({issue.get('count', 0)})")
+                lines.append(f"  {issue['description']}")
+            lines.append("")
+
+        if cmp_data.get("persistent"):
+            lines.append("### ⏳ 持续存在问题")
+            lines.append("")
+            for issue in cmp_data["persistent"]:
+                sev = "🔴 严重" if issue["severity"] == "high" else "🟡 一般"
+                prev = issue.get("prev_count", 0)
+                curr = issue.get("count", 0)
+                trend = "⬆️" if curr > prev else ("⬇️" if curr < prev else "➡️")
+                lines.append(f"- {sev} **{issue['category']}** ({prev} → {curr} {trend})")
+                lines.append(f"  {issue['description']}")
+            lines.append("")
 
     s = report["summary"]
     lines.append("## 总体评估")
@@ -782,6 +1028,71 @@ def _report_to_markdown(report: dict) -> str:
                 sev = "🔴 严重" if issue["severity"] == "high" else "🟡 一般"
                 lines.append(f"| {sev} | {issue['category']} | {issue['detail']} |")
             lines.append("")
+
+    o = report["online_status"]
+    offline_nodes = o.get("offline_nodes", [])
+    mismatch_list = report.get("channel_check", {}).get("mismatched_channels", [])
+    fail_list = report.get("auth_failures", {}).get("failure_list", [])
+    unacked_list = report.get("alarms", {}).get("unacked_list", [])
+
+    has_detail = any([offline_nodes, mismatch_list, fail_list, unacked_list])
+    if has_detail:
+        lines.append("## 异常明细")
+        lines.append("")
+
+    if offline_nodes:
+        lines.append("### 离线节点明细")
+        lines.append("")
+        lines.append(f"共 {len(offline_nodes)} 个离线节点：")
+        lines.append("")
+        lines.append("| 类型 | 节点名称 | 节点ID | 厂商 | IP | 最后检查 |")
+        lines.append("|------|----------|--------|------|-----|----------|")
+        for n in offline_nodes[:50]:
+            lines.append(f"| {n['node_type']} | {n['name']} | {n['node_id']} | {n.get('manufacturer', '')} | {n.get('ip', '')} | {n.get('last_check', '')} |")
+        if len(offline_nodes) > 50:
+            lines.append(f"| ... | 还有 {len(offline_nodes) - 50} 条 | | | | |")
+        lines.append("")
+
+    if mismatch_list:
+        lines.append("### 通道编号不一致明细")
+        lines.append("")
+        lines.append(f"共 {len(mismatch_list)} 个通道编号不一致：")
+        lines.append("")
+        lines.append("| 通道名称 | 通道ID | 上级编号 | 下级编号 | 状态 | 厂商 |")
+        lines.append("|----------|--------|----------|----------|------|------|")
+        for ch in mismatch_list[:50]:
+            lines.append(f"| {ch['name']} | {ch['channel_id']} | {ch['upper_channel_id']} | {ch['lower_channel_id']} | {ch['status']} | {ch.get('manufacturer', '')} |")
+        if len(mismatch_list) > 50:
+            lines.append(f"| ... | 还有 {len(mismatch_list) - 50} 条 | | | | |")
+        lines.append("")
+
+    if fail_list:
+        lines.append("### 鉴权失败明细")
+        lines.append("")
+        lines.append(f"共 {len(fail_list)} 条鉴权失败记录：")
+        lines.append("")
+        lines.append("| 时间 | 设备 | 用户 | 失败原因 | 来源IP |")
+        lines.append("|------|------|------|----------|--------|")
+        for f in fail_list[:50]:
+            ts = f.get("timestamp", "")[:16].replace("T", " ") if f.get("timestamp") else ""
+            lines.append(f"| {ts} | {f['device_name']} ({f['device_id']}) | {f['user']} | {f['reason']} | {f.get('ip', '')} |")
+        if len(fail_list) > 50:
+            lines.append(f"| ... | 还有 {len(fail_list) - 50} 条 | | | |")
+        lines.append("")
+
+    if unacked_list:
+        lines.append("### 未确认告警明细")
+        lines.append("")
+        lines.append(f"共 {len(unacked_list)} 条未确认告警：")
+        lines.append("")
+        lines.append("| 时间 | 源名称 | 源ID | 级别 | 类型 | 描述 |")
+        lines.append("|------|--------|------|------|------|------|")
+        for al in unacked_list[:50]:
+            ts = al.get("timestamp", "")[:16].replace("T", " ") if al.get("timestamp") else ""
+            lines.append(f"| {ts} | {al['source_name']} | {al['source_id']} | {al['level']} | {al['alarm_type']} | {al['description']} |")
+        if len(unacked_list) > 50:
+            lines.append(f"| ... | 还有 {len(unacked_list) - 50} 条 | | | | |")
+        lines.append("")
 
     issues = report["issues"]
     lines.append("## 问题清单")

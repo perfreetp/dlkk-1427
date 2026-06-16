@@ -1,0 +1,34 @@
+{
+  "profile_name": "haikang",
+  "source_project": "demo_project",
+  "exported_at": "2026-06-16T10:12:33.691700",
+  "version": "1.0",
+  "profile": {
+    "description": "海康项目常用检查配置",
+    "check": {
+      "level": "all",
+      "offline_only": false,
+      "check_channels": true,
+      "check_devices": true,
+      "check_platforms": true
+    },
+    "export": {
+      "format": "csv",
+      "include_offline": true,
+      "include_mismatch": true,
+      "include_auth": true,
+      "include_alarm": true
+    },
+    "report": {
+      "format": "markdown",
+      "title": ""
+    },
+    "alarm_sim": {
+      "count": 10,
+      "interval": 1.0,
+      "level": "all",
+      "alarm_type": "all"
+    },
+    "updated_at": "2026-06-16T09:43:55.522687"
+  }
+}
