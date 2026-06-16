@@ -25,17 +25,42 @@ def export_cmd():
 
 @export_cmd.command("anomaly")
 @click.argument("project_name")
-@click.option("--format", "-f", "fmt", type=click.Choice(["csv", "json", "txt"]), default="csv", help="导出格式")
+@click.option("--format", "-f", "fmt", type=click.Choice(["csv", "json", "txt"]), default=None, help="导出格式")
 @click.option("--output", "-o", "output_file", default="", help="输出文件路径")
-@click.option("--include-offline", is_flag=True, default=True, help="包含离线设备")
-@click.option("--include-mismatch", is_flag=True, default=True, help="包含通道编号不匹配")
-@click.option("--include-auth", is_flag=True, default=True, help="包含鉴权失败")
-@click.option("--include-alarm", is_flag=True, default=True, help="包含告警")
-def export_anomaly(project_name, fmt, output_file, include_offline, include_mismatch, include_auth, include_alarm):
+@click.option("--include-offline/--no-include-offline", default=None, help="包含/不包含离线设备")
+@click.option("--include-mismatch/--no-include-mismatch", default=None, help="包含/不包含通道编号不匹配")
+@click.option("--include-auth/--no-include-auth", default=None, help="包含/不包含鉴权失败")
+@click.option("--include-alarm/--no-include-alarm", default=None, help="包含/不包含告警")
+@click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
+def export_anomaly(project_name, fmt, output_file, include_offline, include_mismatch, include_auth, include_alarm, profile_name):
     """导出异常清单"""
     if not config_mgr.project_exists(project_name):
         console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
         return
+
+    if profile_name:
+        try:
+            profile = config_mgr.get_check_profile(project_name, profile_name)
+            export_cfg = profile.get("export", {})
+            if fmt is None and "format" in export_cfg:
+                fmt = export_cfg["format"]
+            if include_offline is None and "include_offline" in export_cfg:
+                include_offline = export_cfg["include_offline"]
+            if include_mismatch is None and "include_mismatch" in export_cfg:
+                include_mismatch = export_cfg["include_mismatch"]
+            if include_auth is None and "include_auth" in export_cfg:
+                include_auth = export_cfg["include_auth"]
+            if include_alarm is None and "include_alarm" in export_cfg:
+                include_alarm = export_cfg["include_alarm"]
+            console.print(f"[dim]使用检查配置: {profile_name}[/dim]")
+        except ValueError as e:
+            console.print(f"[yellow]警告: {e}，使用默认参数[/yellow]")
+
+    fmt = fmt or "csv"
+    include_offline = True if include_offline is None else include_offline
+    include_mismatch = True if include_mismatch is None else include_mismatch
+    include_auth = True if include_auth is None else include_auth
+    include_alarm = True if include_alarm is None else include_alarm
 
     anomalies = _collect_anomalies(
         project_name,

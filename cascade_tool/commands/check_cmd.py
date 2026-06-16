@@ -13,6 +13,29 @@ console = Console()
 config_mgr = ProjectConfig()
 
 
+def _apply_profile(project_name: str, profile_name: str, defaults: dict) -> dict:
+    """应用检查配置，命令行参数优先于profile"""
+    if not profile_name:
+        return defaults
+
+    try:
+        profile = config_mgr.get_check_profile(project_name, profile_name)
+    except ValueError as e:
+        console.print(f"[yellow]警告: {e}，使用默认参数[/yellow]")
+        return defaults
+
+    check_cfg = profile.get("check", {})
+
+    result = defaults.copy()
+
+    if "level" in check_cfg and defaults.get("level") == "all":
+        result["level"] = check_cfg["level"]
+    if "offline_only" in check_cfg and not defaults.get("offline_only"):
+        result["offline_only"] = check_cfg["offline_only"]
+
+    return result
+
+
 @click.group()
 def check_cmd():
     """批量检查与对照"""
@@ -23,11 +46,22 @@ def check_cmd():
 @click.argument("project_name")
 @click.option("--level", type=click.Choice(["platform", "device", "channel", "all"]), default="all", help="检查层级")
 @click.option("--offline-only", is_flag=True, help="仅显示离线项")
-def check_online(project_name, level, offline_only):
+@click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
+def check_online(project_name, level, offline_only, profile_name):
     """批量检查在线率"""
     if not config_mgr.project_exists(project_name):
         console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
         return
+
+    params = _apply_profile(project_name, profile_name, {
+        "level": level,
+        "offline_only": offline_only
+    })
+    level = params["level"]
+    offline_only = params["offline_only"]
+
+    if profile_name:
+        console.print(f"[dim]使用检查配置: {profile_name}[/dim]")
 
     topo_data = config_mgr.load_data_file(project_name, "topology.json")
     if not topo_data:
@@ -192,11 +226,24 @@ def _status_str(status: OnlineStatus) -> str:
 @click.argument("project_name")
 @click.option("--mismatch-only", is_flag=True, help="仅显示编号不匹配的通道")
 @click.option("--offline-only", is_flag=True, help="仅显示离线通道")
-def check_channel(project_name, mismatch_only, offline_only):
+@click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
+def check_channel(project_name, mismatch_only, offline_only, profile_name):
     """对比上下级通道编号"""
     if not config_mgr.project_exists(project_name):
         console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
         return
+
+    if profile_name:
+        try:
+            profile = config_mgr.get_check_profile(project_name, profile_name)
+            check_cfg = profile.get("check", {})
+            if not mismatch_only and check_cfg.get("mismatch_only", False):
+                mismatch_only = True
+            if not offline_only and check_cfg.get("offline_only", False):
+                offline_only = True
+            console.print(f"[dim]使用检查配置: {profile_name}[/dim]")
+        except ValueError as e:
+            console.print(f"[yellow]警告: {e}，使用默认参数[/yellow]")
 
     ch_data = config_mgr.load_data_file(project_name, "channels.json")
     if not ch_data:
@@ -261,14 +308,18 @@ def check_channel(project_name, mismatch_only, offline_only):
 
 @check_cmd.command("all")
 @click.argument("project_name")
-def check_all(project_name):
+@click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
+def check_all(project_name, profile_name):
     """执行全部检查项"""
     console.print(f"[bold cyan]=== 开始对项目 '{project_name}' 执行全部检查 ===[/bold cyan]\n")
 
-    click.echo()
-    check_online.callback(project_name=project_name, level="all", offline_only=False)
+    if profile_name:
+        console.print(f"[dim]使用检查配置: {profile_name}[/dim]\n")
 
     click.echo()
-    check_channel.callback(project_name=project_name, mismatch_only=False, offline_only=False)
+    check_online.callback(project_name=project_name, level="all", offline_only=False, profile_name=profile_name)
+
+    click.echo()
+    check_channel.callback(project_name=project_name, mismatch_only=False, offline_only=False, profile_name=profile_name)
 
     console.print(f"\n[bold green]=== 全部检查完成 ===[/bold green]")

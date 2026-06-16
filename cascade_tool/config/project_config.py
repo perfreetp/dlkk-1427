@@ -71,6 +71,7 @@ class ProjectConfig:
                 "check_devices": True,
                 "check_platforms": True
             },
+            "check_profiles": {},
             "platforms": [],
             "devices": [],
             "channels": []
@@ -137,3 +138,78 @@ class ProjectConfig:
                 return f.read()
         else:
             raise ValueError(f"不支持的格式: {fmt}")
+
+    def list_check_profiles(self, project_name: str) -> List[Dict[str, Any]]:
+        """列出项目的所有检查配置"""
+        config = self.get_config(project_name)
+        profiles = config.get("check_profiles", {})
+        result = []
+        for name, profile in profiles.items():
+            result.append({
+                "name": name,
+                "description": profile.get("description", ""),
+                "created_at": profile.get("created_at", ""),
+                "updated_at": profile.get("updated_at", "")
+            })
+        return result
+
+    def get_check_profile(self, project_name: str, profile_name: str) -> Dict[str, Any]:
+        """获取指定检查配置"""
+        config = self.get_config(project_name)
+        profiles = config.get("check_profiles", {})
+        if profile_name not in profiles:
+            raise ValueError(f"检查配置 '{profile_name}' 不存在")
+        return profiles[profile_name]
+
+    def save_check_profile(self, project_name: str, profile_name: str, profile: Dict[str, Any]):
+        """保存检查配置"""
+        config = self.get_config(project_name)
+        if "check_profiles" not in config:
+            config["check_profiles"] = {}
+
+        now = datetime.now().isoformat()
+        if profile_name not in config["check_profiles"]:
+            profile["created_at"] = now
+        profile["updated_at"] = now
+        config["check_profiles"][profile_name] = profile
+        self.update_config(project_name, config)
+
+    def delete_check_profile(self, project_name: str, profile_name: str):
+        """删除检查配置"""
+        config = self.get_config(project_name)
+        profiles = config.get("check_profiles", {})
+        if profile_name not in profiles:
+            raise ValueError(f"检查配置 '{profile_name}' 不存在")
+        del profiles[profile_name]
+        config["check_profiles"] = profiles
+        self.update_config(project_name, config)
+
+    def get_default_check_profile(self) -> Dict[str, Any]:
+        """获取默认检查配置模板"""
+        return {
+            "description": "",
+            "check": {
+                "level": "all",
+                "offline_only": False,
+                "check_channels": True,
+                "check_devices": True,
+                "check_platforms": True
+            },
+            "export": {
+                "format": "csv",
+                "include_offline": True,
+                "include_mismatch": True,
+                "include_auth": True,
+                "include_alarm": True
+            },
+            "report": {
+                "format": "txt",
+                "title": ""
+            },
+            "alarm_sim": {
+                "count": 5,
+                "interval": 1.0,
+                "level": "all",
+                "alarm_type": "all"
+            }
+        }

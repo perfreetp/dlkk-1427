@@ -26,16 +26,38 @@ def report_cmd():
 
 @report_cmd.command("generate")
 @click.argument("project_name")
-@click.option("--format", "-f", "fmt", type=click.Choice(["txt", "json", "markdown"]), default="txt", help="报告格式")
+@click.option("--format", "-f", "fmt", type=click.Choice(["txt", "json", "markdown"]), default=None, help="报告格式")
 @click.option("--output", "-o", "output_file", default="", help="输出文件路径")
 @click.option("--title", default="", help="报告标题")
-def generate_report(project_name, fmt, output_file, title):
+@click.option("--profile", "-p", "profile_name", default="", help="使用指定检查配置")
+@click.option("--healthcheck", "healthcheck_node", default="", help="包含指定节点的链路体检结果")
+def generate_report(project_name, fmt, output_file, title, profile_name, healthcheck_node):
     """生成联调报告"""
     if not config_mgr.project_exists(project_name):
         console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
         return
 
-    report_data = _build_report_data(project_name, title)
+    profile = None
+    if profile_name:
+        try:
+            profile = config_mgr.get_check_profile(project_name, profile_name)
+            console.print(f"[dim]使用检查配置: {profile_name}[/dim]")
+            if fmt is None and profile.get("report", {}).get("format"):
+                fmt = profile["report"]["format"]
+            if not title and profile.get("report", {}).get("title"):
+                title = profile["report"]["title"]
+        except ValueError as e:
+            console.print(f"[yellow]警告: {e}[/yellow]")
+
+    fmt = fmt or "txt"
+
+    report_data = _build_report_data(
+        project_name,
+        title=title,
+        profile_name=profile_name,
+        profile=profile,
+        healthcheck_node=healthcheck_node
+    )
 
     if not output_file:
         ext = "md" if fmt == "markdown" else fmt
@@ -61,18 +83,22 @@ def generate_report(project_name, fmt, output_file, title):
     _print_report_summary(report_data)
 
 
-def _build_report_data(project_name: str, title: str = "") -> dict:
+def _build_report_data(project_name: str, title: str = "", profile_name: str = "",
+                       profile: dict = None, healthcheck_node: str = "") -> dict:
     """构建报告数据"""
     report = {
         "title": title or f"{project_name} 级联联调报告",
         "project": project_name,
         "generated_at": datetime.now().isoformat(),
+        "used_profile": profile_name,
+        "profile_config": profile,
         "summary": {},
         "topology": {},
         "online_status": {},
         "channel_check": {},
         "auth_failures": {},
         "alarms": {},
+        "healthcheck": None,
         "issues": []
     }
 
@@ -97,6 +123,12 @@ def _build_report_data(project_name: str, title: str = "") -> dict:
     if alarm_data:
         alarms = [Alarm.from_dict(d) for d in alarm_data]
         report["alarms"] = _analyze_alarms(alarms)
+
+    if healthcheck_node and topo_data:
+        topology = CascadeNode.from_dict(topo_data)
+        report["healthcheck"] = _build_healthcheck_report(
+            topology, healthcheck_node, ch_data, auth_data, alarm_data
+        )
 
     report["issues"] = _collect_issues(report)
     report["summary"] = _build_summary(report)
@@ -301,6 +333,153 @@ def _build_summary(report: dict) -> dict:
     }
 
 
+def _build_healthcheck_report(topology: CascadeNode, node_id: str,
+                              ch_data: list, auth_data: list, alarm_data: list) -> dict:
+    """构建链路体检报告数据"""
+    from cascade_tool.commands.diag_cmd import _find_node_path
+
+    path = _find_node_path(topology, node_id)
+    if not path:
+        return {"node_id": node_id, "found": False}
+
+    target = path[-1]
+    device_id = ""
+    for node in reversed(path):
+        if node.node_type == NodeType.DEVICE:
+            device_id = node.node_id
+            break
+
+    link_info = []
+    for i, node in enumerate(path, 1):
+        link_info.append({
+            "level": f"L{i}",
+            "node_id": node.node_id,
+            "name": node.name,
+            "type": node.node_type.value,
+            "manufacturer": node.manufacturer,
+            "protocol": node.protocol,
+            "ip": node.ip,
+            "port": node.port,
+            "status": node.status.value
+        })
+
+    channel_info = None
+    if ch_data and (target.node_type == NodeType.CHANNEL or target.node_type == NodeType.DEVICE):
+        channels = [Channel.from_dict(d) for d in ch_data]
+        if target.node_type == NodeType.CHANNEL:
+            matched = [c for c in channels if c.channel_id == target.node_id]
+            if matched:
+                ch = matched[0]
+                channel_info = {
+                    "type": "single",
+                    "channel_id": ch.channel_id,
+                    "name": ch.name,
+                    "parent_device": ch.parent_device_id,
+                    "upper_id": ch.upper_channel_id,
+                    "lower_id": ch.lower_channel_id,
+                    "matched": ch.upper_channel_id == ch.lower_channel_id,
+                    "status": ch.status.value
+                }
+        elif target.node_type == NodeType.DEVICE:
+            dev_channels = [c for c in channels if c.parent_device_id == target.node_id]
+            mismatched = [c for c in dev_channels if c.upper_channel_id != c.lower_channel_id]
+            offline = [c for c in dev_channels if c.status != ChannelStatus.ONLINE]
+            channel_info = {
+                "type": "device",
+                "total": len(dev_channels),
+                "mismatched": len(mismatched),
+                "offline": len(offline),
+                "mismatch_list": [
+                    {"id": c.channel_id, "name": c.name, "upper": c.upper_channel_id, "lower": c.lower_channel_id}
+                    for c in mismatched[:5]
+                ]
+            }
+
+    auth_info = None
+    if auth_data and device_id:
+        failures = [AuthFailure.from_dict(d) for d in auth_data]
+        dev_failures = [f for f in failures if f.device_id == device_id]
+        if dev_failures:
+            from collections import Counter
+            reason_counter = Counter(f.reason for f in dev_failures)
+            auth_info = {
+                "device_id": device_id,
+                "total_failures": len(dev_failures),
+                "recent": [
+                    {
+                        "time": f.timestamp.isoformat() if f.timestamp else "",
+                        "user": f.user,
+                        "reason": f.reason,
+                        "ip": f.ip
+                    }
+                    for f in dev_failures[:5]
+                ],
+                "top_reasons": dict(reason_counter.most_common(3))
+            }
+
+    alarm_info = None
+    if alarm_data:
+        alarms = [Alarm.from_dict(d) for d in alarm_data]
+        related = [a for a in alarms if not a.acked and (
+            a.source_id == node_id or
+            node_id.startswith(a.source_id) or
+            a.source_id.startswith(node_id)
+        )]
+        if related:
+            alarm_info = {
+                "total_unacked": len(related),
+                "recent": [
+                    {
+                        "time": a.timestamp.isoformat() if a.timestamp else "",
+                        "level": a.level.value,
+                        "type": a.alarm_type.value,
+                        "source": a.source_name,
+                        "description": a.description
+                    }
+                    for a in related[:5]
+                ]
+            }
+
+    issues = []
+    link_offline = [n for n in path if n.status != OnlineStatus.ONLINE]
+    if link_offline:
+        issues.append({"category": "链路异常", "detail": f"{len(link_offline)} 个节点离线", "severity": "high"})
+    if channel_info:
+        if channel_info.get("type") == "single" and not channel_info.get("matched", True):
+            issues.append({"category": "通道编号", "detail": "上下级编号不一致", "severity": "high"})
+        elif channel_info.get("type") == "device" and channel_info.get("mismatched", 0) > 0:
+            issues.append({
+                "category": "通道编号",
+                "detail": f"{channel_info['mismatched']} 个编号不匹配",
+                "severity": "medium"
+            })
+    if auth_info and auth_info["total_failures"] > 0:
+        issues.append({
+            "category": "鉴权失败",
+            "detail": f"{auth_info['total_failures']} 次失败记录",
+            "severity": "high"
+        })
+    if alarm_info and alarm_info["total_unacked"] > 0:
+        issues.append({
+            "category": "未确认告警",
+            "detail": f"{alarm_info['total_unacked']} 条未处理",
+            "severity": "medium"
+        })
+
+    return {
+        "node_id": node_id,
+        "node_name": target.name,
+        "node_type": target.node_type.value,
+        "found": True,
+        "cascade_levels": len(path),
+        "link": link_info,
+        "channel_info": channel_info,
+        "auth_failures": auth_info,
+        "alarms": alarm_info,
+        "issues": issues
+    }
+
+
 def _report_to_txt(report: dict) -> str:
     """生成文本格式报告"""
     lines = []
@@ -309,6 +488,11 @@ def _report_to_txt(report: dict) -> str:
     lines.append("=" * 70)
     lines.append(f"项目名称: {report['project']}")
     lines.append(f"生成时间: {report['generated_at']}")
+    if report.get("used_profile"):
+        lines.append(f"检查配置: {report['used_profile']}")
+        profile_cfg = report.get("profile_config", {})
+        if profile_cfg and profile_cfg.get("description"):
+            lines.append(f"配置描述: {profile_cfg['description']}")
     lines.append("")
 
     s = report["summary"]
@@ -371,6 +555,51 @@ def _report_to_txt(report: dict) -> str:
             lines.append(f"    - {level}: {count} 条")
     lines.append("")
 
+    hc = report.get("healthcheck")
+    if hc and hc.get("found"):
+        lines.append("【链路体检】")
+        lines.append(f"  目标节点: {hc['node_name']} ({hc['node_id']})")
+        lines.append(f"  级联层级: {hc['cascade_levels']} 级")
+        lines.append("  链路:")
+        for link in hc.get("link", []):
+            status_str = "在线" if link["status"] == "online" else ("离线" if link["status"] == "offline" else link["status"])
+            lines.append(f"    {link['level']}: {link['name']} ({link['node_id']}) [{link['type']}] - {status_str}")
+
+        ci = hc.get("channel_info")
+        if ci:
+            if ci.get("type") == "single":
+                lines.append("  通道信息:")
+                lines.append(f"    名称: {ci.get('name', '')}")
+                lines.append(f"    上级编号: {ci.get('upper_id', '')}")
+                lines.append(f"    下级编号: {ci.get('lower_id', '')}")
+                match_str = "一致" if ci.get("matched") else "不一致"
+                lines.append(f"    编号对照: {match_str}")
+            elif ci.get("type") == "device":
+                lines.append("  设备通道统计:")
+                lines.append(f"    通道总数: {ci.get('total', 0)}")
+                lines.append(f"    编号不匹配: {ci.get('mismatched', 0)}")
+                lines.append(f"    离线通道: {ci.get('offline', 0)}")
+
+        af = hc.get("auth_failures")
+        if af:
+            lines.append(f"  鉴权失败: {af.get('total_failures', 0)} 次")
+            if af.get("top_reasons"):
+                lines.append("  主要原因:")
+                for reason, count in list(af["top_reasons"].items())[:3]:
+                    lines.append(f"    - {reason}: {count} 次")
+
+        al = hc.get("alarms")
+        if al:
+            lines.append(f"  未确认告警: {al.get('total_unacked', 0)} 条")
+
+        hc_issues = hc.get("issues", [])
+        if hc_issues:
+            lines.append("  体检发现问题:")
+            for issue in hc_issues:
+                sev = "严重" if issue["severity"] == "high" else "一般"
+                lines.append(f"    - [{sev}] {issue['category']}: {issue['detail']}")
+        lines.append("")
+
     issues = report["issues"]
     lines.append("【问题清单】")
     if issues:
@@ -396,6 +625,11 @@ def _report_to_markdown(report: dict) -> str:
     lines.append("")
     lines.append(f"- **项目名称**: {report['project']}")
     lines.append(f"- **生成时间**: {report['generated_at']}")
+    if report.get("used_profile"):
+        lines.append(f"- **检查配置**: {report['used_profile']}")
+        profile_cfg = report.get("profile_config", {})
+        if profile_cfg and profile_cfg.get("description"):
+            lines.append(f"- **配置描述**: {profile_cfg['description']}")
     lines.append("")
 
     s = report["summary"]
@@ -480,6 +714,74 @@ def _report_to_markdown(report: dict) -> str:
         for level, count in alm["by_level"].items():
             lines.append(f"| {level} | {count} |")
         lines.append("")
+
+    hc = report.get("healthcheck")
+    if hc and hc.get("found"):
+        lines.append("## 链路体检")
+        lines.append("")
+        lines.append(f"**目标节点**: {hc['node_name']} ({hc['node_id']})  ")
+        lines.append(f"**级联层级**: {hc['cascade_levels']} 级")
+        lines.append("")
+
+        lines.append("### 级联链路")
+        lines.append("")
+        lines.append("| 层级 | 节点名称 | 节点ID | 类型 | 状态 |")
+        lines.append("|------|----------|--------|------|------|")
+        for link in hc.get("link", []):
+            status_str = "🟢 在线" if link["status"] == "online" else ("🔴 离线" if link["status"] == "offline" else "⚪ " + link["status"])
+            lines.append(f"| {link['level']} | {link['name']} | {link['node_id']} | {link['type']} | {status_str} |")
+        lines.append("")
+
+        ci = hc.get("channel_info")
+        if ci:
+            lines.append("### 通道信息")
+            lines.append("")
+            if ci.get("type") == "single":
+                match_str = "✅ 一致" if ci.get("matched") else "❌ 不一致"
+                lines.append("| 项目 | 值 |")
+                lines.append("|------|-----|")
+                lines.append(f"| 通道名称 | {ci.get('name', '')} |")
+                lines.append(f"| 上级编号 | {ci.get('upper_id', '')} |")
+                lines.append(f"| 下级编号 | {ci.get('lower_id', '')} |")
+                lines.append(f"| 编号对照 | {match_str} |")
+            elif ci.get("type") == "device":
+                lines.append("| 项目 | 数量 |")
+                lines.append("|------|------|")
+                lines.append(f"| 通道总数 | {ci.get('total', 0)} |")
+                lines.append(f"| 编号不匹配 | {ci.get('mismatched', 0)} |")
+                lines.append(f"| 离线通道 | {ci.get('offline', 0)} |")
+            lines.append("")
+
+        af = hc.get("auth_failures")
+        if af:
+            lines.append("### 鉴权失败")
+            lines.append("")
+            lines.append(f"**失败次数**: {af.get('total_failures', 0)}")
+            lines.append("")
+            if af.get("top_reasons"):
+                lines.append("**主要原因**:")
+                lines.append("")
+                for reason, count in list(af["top_reasons"].items())[:3]:
+                    lines.append(f"- {reason}: {count} 次")
+                lines.append("")
+
+        al = hc.get("alarms")
+        if al:
+            lines.append("### 未确认告警")
+            lines.append("")
+            lines.append(f"**未确认数量**: {al.get('total_unacked', 0)} 条")
+            lines.append("")
+
+        hc_issues = hc.get("issues", [])
+        if hc_issues:
+            lines.append("### 体检发现问题")
+            lines.append("")
+            lines.append("| 严重度 | 类别 | 描述 |")
+            lines.append("|--------|------|------|")
+            for issue in hc_issues:
+                sev = "🔴 严重" if issue["severity"] == "high" else "🟡 一般"
+                lines.append(f"| {sev} | {issue['category']} | {issue['detail']} |")
+            lines.append("")
 
     issues = report["issues"]
     lines.append("## 问题清单")

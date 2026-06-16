@@ -123,3 +123,148 @@ def delete_project(project_name, force):
 
     config_mgr.delete_project(project_name)
     console.print(f"[green]✓ 项目 '{project_name}' 已删除[/green]")
+
+
+@init_cmd.group("profile")
+def profile_cmd():
+    """管理检查配置模板"""
+    pass
+
+
+@profile_cmd.command("list")
+@click.argument("project_name")
+def list_profiles(project_name):
+    """列出项目的所有检查配置"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    profiles = config_mgr.list_check_profiles(project_name)
+    if not profiles:
+        console.print(f"[yellow]项目 '{project_name}' 暂无检查配置[/yellow]")
+        return
+
+    table = Table(title=f"检查配置列表 - {project_name}", show_header=True, header_style="bold cyan")
+    table.add_column("配置名")
+    table.add_column("描述")
+    table.add_column("创建时间")
+    table.add_column("更新时间")
+
+    for p in profiles:
+        table.add_row(
+            p["name"],
+            p["description"] or "(无)",
+            p["created_at"],
+            p["updated_at"]
+        )
+
+    console.print(table)
+
+
+@profile_cmd.command("show")
+@click.argument("project_name")
+@click.argument("profile_name")
+def show_profile(project_name, profile_name):
+    """显示检查配置详情"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    try:
+        profile = config_mgr.get_check_profile(project_name, profile_name)
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")
+        return
+
+    import json
+    console.print(Panel(
+        json.dumps(profile, indent=2, ensure_ascii=False),
+        title=f"检查配置: {profile_name}",
+        border_style="cyan"
+    ))
+
+
+@profile_cmd.command("save")
+@click.argument("project_name")
+@click.argument("profile_name")
+@click.option("-d", "--desc", "description", default="", help="配置描述")
+@click.option("--check-level", type=click.Choice(["platform", "device", "channel", "all"]), default="all", help="检查层级")
+@click.option("--offline-only", is_flag=True, default=False, help="仅显示离线项")
+@click.option("--export-format", type=click.Choice(["csv", "json", "txt"]), default="csv", help="导出格式")
+@click.option("--report-format", type=click.Choice(["txt", "json", "markdown"]), default="txt", help="报告格式")
+@click.option("--alarm-count", type=int, default=5, help="告警模拟数量")
+@click.option("--alarm-level", type=click.Choice(["critical", "major", "minor", "info", "all"]), default="all", help="告警级别")
+@click.option("--from-default", is_flag=True, help="从默认模板创建")
+def save_profile(project_name, profile_name, description, check_level, offline_only,
+                 export_format, report_format, alarm_count, alarm_level, from_default):
+    """保存/更新检查配置"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    if from_default:
+        profile = config_mgr.get_default_check_profile()
+    else:
+        profile = {
+            "description": description,
+            "check": {
+                "level": check_level,
+                "offline_only": offline_only,
+                "check_channels": True,
+                "check_devices": True,
+                "check_platforms": True
+            },
+            "export": {
+                "format": export_format,
+                "include_offline": True,
+                "include_mismatch": True,
+                "include_auth": True,
+                "include_alarm": True
+            },
+            "report": {
+                "format": report_format,
+                "title": ""
+            },
+            "alarm_sim": {
+                "count": alarm_count,
+                "interval": 1.0,
+                "level": alarm_level,
+                "alarm_type": "all"
+            }
+        }
+
+    if description and not from_default:
+        profile["description"] = description
+
+    try:
+        existing = config_mgr.get_check_profile(project_name, profile_name)
+        is_new = False
+    except ValueError:
+        is_new = True
+
+    config_mgr.save_check_profile(project_name, profile_name, profile)
+
+    if is_new:
+        console.print(f"[green]✓ 检查配置 '{profile_name}' 已创建[/green]")
+    else:
+        console.print(f"[green]✓ 检查配置 '{profile_name}' 已更新[/green]")
+
+
+@profile_cmd.command("delete")
+@click.argument("project_name")
+@click.argument("profile_name")
+@click.option("--force", "-f", is_flag=True, help="强制删除，不提示")
+def delete_profile(project_name, profile_name, force):
+    """删除检查配置"""
+    if not config_mgr.project_exists(project_name):
+        console.print(f"[red]错误: 项目 '{project_name}' 不存在[/red]")
+        return
+
+    if not force:
+        click.confirm(f"确定要删除检查配置 '{profile_name}' 吗？", abort=True)
+
+    try:
+        config_mgr.delete_check_profile(project_name, profile_name)
+        console.print(f"[green]✓ 检查配置 '{profile_name}' 已删除[/green]")
+    except ValueError as e:
+        console.print(f"[red]错误: {e}[/red]")
